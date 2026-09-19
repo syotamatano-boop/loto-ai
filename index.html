@@ -1,0 +1,131 @@
+<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#111827"><link rel="manifest" href="manifest.webmanifest"><title>LOTO AI</title><style>
+*{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;margin:0;background:#f3f4f6;color:#111827}.wrap{max-width:560px;margin:auto;padding:16px 16px 34px}header{display:flex;justify-content:space-between;align-items:end;margin:6px 0 12px}.muted{color:#6b7280;font-size:12px}.card{background:#fff;border-radius:18px;padding:17px;margin:12px 0;box-shadow:0 2px 12px #0000000d}.row{display:flex;justify-content:space-between;gap:8px;align-items:center}.nums{display:flex;flex-wrap:wrap;gap:7px;margin-top:7px}.n{width:38px;height:38px;border-radius:50%;display:grid;place-items:center;background:#e5e7eb;font-weight:750}.final .n{background:#111827;color:white}.alt{margin-top:12px;padding-top:10px;border-top:1px solid #eee}.tag{font-size:11px;background:#eef2ff;padding:4px 7px;border-radius:999px}.metric{font-size:12px;color:#4b5563;margin-top:9px}button{width:100%;padding:15px;border:0;border-radius:14px;background:#111827;color:white;font-weight:750;font-size:16px}details{margin-top:12px}summary{font-weight:650;cursor:pointer}h1{font-size:25px;margin:0}h2{margin:0;font-size:21px}.warn{font-size:11px;color:#6b7280;line-height:1.5;margin-top:14px}.audit{font-size:12px;line-height:1.55;margin-top:8px}.ok{color:#166534}.bad{color:#991b1b}.stale{color:#92400e}.eval{margin-top:12px;padding:11px;border-radius:12px;background:#f9fafb}.evalgrid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px}.evalv{font-weight:750;font-size:14px}.neutral{color:#374151}</style></head><body><main class="wrap"><header><div><h1>LOTO AI <span class="tag">v6.1</span></h1><div class="muted">ロト6・ロト7 統合分析</div></div><div class="muted" id="updated"></div></header><div id="status" class="muted" style="margin:8px 2px"></div><div id="cards"></div><button id="run">分析を更新</button><p class="warn">履歴取得元は非公式CSVを使用し、固定した公式アンカーと照合します。最新回・監査に失敗した場合は予測を停止します。<br>統計スコアは過去データの特徴を数値化したもので、当せん確率や当せん保証を示すものではありません。</p></main><script>
+const APP_VERSION='6.1.0';
+const CFG={l6:{name:'ロト6',max:43,pick:6,bonus:1,minBuildDraw:2138},l7:{name:'ロト7',max:37,pick:7,bonus:2,minBuildDraw:695}};
+let DATA={l6:[],l7:[]};
+let META={};
+const BTCACHE_KEY=`loto-bt-${APP_VERSION}`;
+const DATA_CACHE_PREFIX=`loto-data-${APP_VERSION}-`;
+const LEGACY_DATA_KEYS=['loto-data-l6','loto-data-l7'];
+let BTCACHE={};
+try{BTCACHE=JSON.parse(localStorage.getItem(BTCACHE_KEY)||'{}')||{}}catch(_){BTCACHE={}}
+function datasetSig(key){const f=META.freshness?.[key];return `${APP_VERSION}:${key}:${DATA[key]?.length||0}:${f?.lastDraw||0}:${f?.lastDate||''}`}
+function safeJSON(key){try{return JSON.parse(localStorage.getItem(key)||'null')}catch(_){try{localStorage.removeItem(key)}catch(__){}return null}}
+function purgeLegacy(){for(const k of LEGACY_DATA_KEYS){try{localStorage.removeItem(k)}catch(_){}}try{localStorage.removeItem('loto-bt-v59')}catch(_){}}
+function saveBTCache(){try{localStorage.setItem(BTCACHE_KEY,JSON.stringify(BTCACHE))}catch(_){}}
+const REMOTE={
+  l6:['./data/LOTO6_ALL.csv','https://www.mk-mode.com/rails/loto/LOTO6_ALL.csv'],
+  l7:['./data/LOTO7_ALL.csv','https://www.mk-mode.com/rails/loto/LOTO7_ALL.csv']
+};
+// 公式一次資料（みずほ銀行）から固定した監査アンカー。公開CSVを「公式」とは扱わず、取得後に照合する。
+const OFFICIAL_ANCHOR={
+  l6:[
+    {draw:1,main:[2,8,10,13,27,30],bonus:[39]},
+    {draw:2,main:[1,9,16,20,21,43],bonus:[5]},
+    {draw:20,main:[7,29,33,35,37,39],bonus:[19]},
+    {draw:21,main:[5,7,13,19,38,41],bonus:[42]},
+    {draw:40,main:[5,17,25,34,38,39],bonus:[2]},
+    {draw:101,main:[21,27,29,30,36,40],bonus:[23]},
+    {draw:120,main:[15,18,22,25,36,40],bonus:[14]}
+  ],
+  l7:[
+    {draw:1,main:[7,10,12,17,23,28,34],bonus:[3,15]},
+    {draw:2,main:[20,24,29,31,33,34,35],bonus:[12,32]},
+    {draw:3,main:[2,7,8,11,14,23,31],bonus:[5,15]},
+    {draw:20,main:[2,5,13,20,21,23,28],bonus:[11,22]},
+    {draw:50,main:[3,4,7,8,15,24,29],bonus:[11,16]}
+  ]
+};
+function splitCSVLine(line){
+  const out=[];let cur='',q=false;
+  for(let i=0;i<line.length;i++){const ch=line[i];if(ch==='"'){if(q&&line[i+1]==='"'){cur+='"';i++}else q=!q}else if(ch===','&&!q){out.push(cur);cur=''}else cur+=ch}out.push(cur);return out;
+}
+function parseRemoteCSV(key,text){
+  const rows=text.replace(/^\uFEFF/,'').trim().split(/\r?\n/).slice(1).filter(Boolean);
+  const c=CFG[key],draws=[];
+  for(const line of rows){
+    const a=splitCSVLine(line).map(x=>x.trim());
+    const draw=Number((a[0]||'').replace(/\D/g,'')),date=a[1]||null;
+    const main=a.slice(2,2+c.pick).map(Number),bonus=a.slice(2+c.pick,2+c.pick+c.bonus).map(Number);
+    if(!Number.isInteger(draw)||main.length!==c.pick||bonus.length!==c.bonus||main.some(n=>!Number.isInteger(n))||bonus.some(n=>!Number.isInteger(n)))continue;
+    draws.push({draw,date,main:[...main].sort((x,y)=>x-y),bonus});
+  }
+  draws.sort((a,b)=>a.draw-b.draw);
+  return {meta:{source:'mk-mode.com CSV (非公式・公式アンカー照合)',retrieved:new Date().toISOString(),records:draws.length},draws};
+}
+async function responseTextJP(r){
+  const buf=await r.arrayBuffer();
+  for(const enc of ['shift_jis','utf-8']){try{const t=new TextDecoder(enc,{fatal:true}).decode(buf);if(t.includes(','))return t}catch(_){}}
+  return new TextDecoder('utf-8').decode(buf);
+}
+function sameNums(a,b){return Array.isArray(a)&&Array.isArray(b)&&a.length===b.length&&[...a].sort((x,y)=>x-y).every((x,i)=>x===[...b].sort((x,y)=>x-y)[i])}
+function auditOfficial(key,obj){
+  const anchors=OFFICIAL_ANCHOR[key]||[],byDraw=new Map(obj.draws.map(d=>[d.draw,d])),errors=[];
+  for(const a of anchors){const d=byDraw.get(a.draw);if(!d||!sameNums(d.main,a.main)||!sameNums(d.bonus,a.bonus))errors.push(`第${a.draw}回`)}
+  if(errors.length) throw new Error(`${CFG[key].name}: 公式監査不一致 ${errors.join('・')}`);
+  return {checked:anchors.length,status:anchors.length?'PASS':'NO_OFFICIAL_ANCHOR'};
+}
+function freshness(key,obj){
+  const rows=obj.draws,last=rows[rows.length-1],retrieved=obj.meta?.retrieved||null;
+  let ageDays=null;if(retrieved){const t=Date.parse(retrieved);if(Number.isFinite(t))ageDays=Math.floor((Date.now()-t)/86400000)}
+  // L6は週2回、L7は週1回。回号の自動推測はせず、キャッシュ取得時刻だけで古さを警告する。
+  const stale=ageDays!==null&&ageDays>8;
+  return {lastDraw:last?.draw||null,lastDate:last?.date||null,ageDays,stale};
+}
+function validateDataset(key,obj){
+  const c=CFG[key],seen=new Set(); if(!obj.draws?.length) throw new Error(`${c.name}: 履歴データなし`);
+  let prev=0;
+  for(const d of obj.draws){
+    if(!Number.isInteger(d.draw)||seen.has(d.draw)||d.draw<=prev) throw new Error(`${c.name}: 回号異常 ${d.draw}`);seen.add(d.draw);prev=d.draw;
+    if(!Array.isArray(d.main)||d.main.length!==c.pick||new Set(d.main).size!==c.pick) throw new Error(`${c.name}: 本数字異常 第${d.draw}回`);
+    if(d.main.some(n=>!Number.isInteger(n)||n<1||n>c.max)) throw new Error(`${c.name}: 数字範囲異常 第${d.draw}回`);
+    if(!Array.isArray(d.bonus)||d.bonus.length!==c.bonus||new Set(d.bonus).size!==c.bonus) throw new Error(`${c.name}: ボーナス個数異常 第${d.draw}回`);
+    if(d.bonus.some(n=>!Number.isInteger(n)||d.main.includes(n)||n<1||n>c.max)) throw new Error(`${c.name}: ボーナス数字異常 第${d.draw}回`);
+  }
+  if(obj.draws[obj.draws.length-1].draw-obj.draws[0].draw+1!==obj.draws.length) throw new Error(`${c.name}: 回号に欠番があります`);
+  const lastDraw=obj.draws[obj.draws.length-1].draw;
+  if(lastDraw<c.minBuildDraw) throw new Error(`${c.name}: 履歴が古すぎます（最終 #${lastDraw} / この版の最低確認回 #${c.minBuildDraw}）`);
+}
+async function fetchRemote(key){
+  let lastErr=null;
+  for(const url of REMOTE[key]){
+    try{
+      const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);
+      const obj=parseRemoteCSV(key,await responseTextJP(r));validateDataset(key,obj);const audit=auditOfficial(key,obj);
+      obj.meta={...obj.meta,audit,delivery:url.startsWith('./')?'same-origin':'external-fallback'};
+      localStorage.setItem(`${DATA_CACHE_PREFIX}${key}`,JSON.stringify(obj));return obj;
+    }catch(e){lastErr=e}
+  }
+  throw new Error(`${CFG[key].name}: 履歴取得失敗 (${lastErr?.message||'unknown'})`);
+}
+async function loadOne(key){
+  try{const local=await fetch(`./data/${key==='l6'?'loto6':'loto7'}.json`,{cache:'no-store'}).then(r=>r.json());if(local.draws?.length){validateDataset(key,local);auditOfficial(key,local);return local}}catch(_){ }
+  const cacheKey=`${DATA_CACHE_PREFIX}${key}`;const cached=safeJSON(cacheKey);if(cached?.draws?.length){try{validateDataset(key,cached);auditOfficial(key,cached);return cached}catch(_){try{localStorage.removeItem(cacheKey)}catch(__){}}}
+  return await fetchRemote(key);
+}
+async function loadData(){
+  document.getElementById('status').textContent='履歴データを検査・読込中…';
+  const [l6,l7]=await Promise.all([loadOne('l6'),loadOne('l7')]);
+  DATA.l6=l6.draws.map(x=>x.main);DATA.l7=l7.draws.map(x=>x.main);META={l6:l6.meta,l7:l7.meta};
+  const f6=freshness('l6',l6),f7=freshness('l7',l7);META.freshness={l6:f6,l7:f7};
+  const a6=l6.meta?.audit?.status||auditOfficial('l6',l6).status,a7=l7.meta?.audit?.status||auditOfficial('l7',l7).status;
+  document.getElementById('status').innerHTML=`履歴: ロト6 ${l6.draws.length}回（最終 #${f6.lastDraw}） / ロト7 ${l7.draws.length}回（最終 #${f7.lastDraw}）<div class="audit ${a6==='PASS'?'ok':'stale'}">履歴サンプル監査: ロト6 ${a6} / ロト7 ${a7}</div>${!navigator.onLine?'<div class="audit stale">オフライン：保存済み履歴で計算しています。</div>':''}${(f6.stale||f7.stale)?'<div class="audit stale">保存データが8日超です。オンライン時に再取得を推奨します。</div>':''}`;
+}
+function stats(max,draws){const N=draws.length,f=Array(max+1).fill(0),f10=Array(max+1).fill(0),last=Array(max+1).fill(-1),gap=Array(max+1).fill(N);draws.forEach((d,i)=>d.forEach(n=>{f[n]++;last[n]=i;if(i>=N-10)f10[n]++}));for(let n=1;n<=max;n++)if(last[n]>=0)gap[n]=N-1-last[n];let vals=[];for(let n=1;n<=max;n++){const long=f[n]/Math.max(1,N),recent=f10[n]/Math.min(10,N),g=Math.min(gap[n],20)/20;vals.push({n,long,recent,gap:g,raw:.42*recent+.38*long+.20*g})}const lo=Math.min(...vals.map(x=>x.raw)),hi=Math.max(...vals.map(x=>x.raw));vals.forEach(x=>x.score=hi===lo?50:Math.round((x.raw-lo)/(hi-lo)*100));return vals.sort((a,b)=>b.score-a.score||a.n-b.n)}
+function comb(a,k){let out=[];function r(start,x){if(x.length===k){out.push(x.slice());return}for(let i=start;i<=a.length-(k-x.length);i++){x.push(a[i]);r(i+1,x);x.pop()}}r(0,[]);return out}
+function comboScore(c,scoreMap,max){const sum=c.reduce((a,b)=>a+b,0),odd=c.filter(x=>x%2).length,con=c.slice(1).filter((x,i)=>x===c[i]+1).length,base=c.reduce((a,n)=>a+scoreMap[n],0)/c.length;const target=(max+1)*c.length/2,bal=Math.max(0,20-Math.abs(sum-target)*.35),oddBal=Math.max(0,12-Math.abs(odd-c.length/2)*5),seq=Math.max(0,8-con*4);return base*.72+bal+oddBal+seq}
+
+function mean(xs){return xs.length?xs.reduce((a,b)=>a+b,0)/xs.length:null}
+function evalRange(key,start,end){const c=CFG[key],draws=DATA[key],th=[],fh=[];for(let i=start;i<end;i++){const hist=draws.slice(0,i),r=analyzeHistory(key,hist),actual=new Set(draws[i]);th.push(r.top.filter(n=>actual.has(n)).length);fh.push(r.chosen[0].nums.filter(n=>actual.has(n)).length)}return{n:th.length,top:mean(th),final:mean(fh)}}
+function analyzeHistory(key,draws){const c=CFG[key],s=stats(c.max,draws),top=s.slice(0,10).map(x=>x.n).sort((a,b)=>a-b),m=Object.fromEntries(s.map(x=>[x.n,x.score]));const all=comb(top,c.pick).map(nums=>({nums,score:comboScore(nums,m,c.max)})).sort((a,b)=>b.score-a.score);let chosen=[];for(const x of all){if(chosen.every(y=>x.nums.filter(n=>y.nums.includes(n)).length<=c.pick-2))chosen.push(x);if(chosen.length===3)break}if(chosen.length<3)chosen=all.slice(0,3);return{top,chosen,rank:s}}
+function backtestSummary(key){const c=CFG[key],N=DATA[key].length,warm=30;if(N<=warm+20)return null;const sig=datasetSig(key);if(BTCACHE[key]?.sig===sig&&BTCACHE[key]?.result)return BTCACHE[key].result;const usable=N-warm,b=warm+Math.floor(usable*.80);const h=evalRange(key,b,N);const result={holdout:h,randomTop:c.pick*10/c.max,randomFinal:c.pick*c.pick/c.max,cachedAt:new Date().toISOString()};BTCACHE[key]={sig,result};saveBTCache();return result}
+function evalHTML(key){const e=backtestSummary(key);if(!e)return '<div class="eval">履歴不足のため評価できません</div>';const dt=e.holdout.top-e.randomTop,df=e.holdout.final-e.randomFinal;const verdict=(dt>0&&df>0)?'holdoutではランダム期待値を上回りました（将来の優位性を保証しません）':'統計的候補生成として表示します（holdoutで一貫した優位性は確認できません）';return `<div class="eval"><div class="muted">未使用holdout評価（${e.holdout.n}回）</div><div class="evalgrid"><div>TOP10平均<div class="evalv">${e.holdout.top.toFixed(3)}</div></div><div>ランダム期待値<div class="evalv">${e.randomTop.toFixed(3)}</div></div><div>最終平均<div class="evalv">${e.holdout.final.toFixed(3)}</div></div><div>ランダム期待値<div class="evalv">${e.randomFinal.toFixed(3)}</div></div></div><div class="metric neutral">${verdict}</div></div>`}
+
+function analyze(key){const c=CFG[key],s=stats(c.max,DATA[key]),top=s.slice(0,10).map(x=>x.n).sort((a,b)=>a-b),m=Object.fromEntries(s.map(x=>[x.n,x.score]));const all=comb(top,c.pick).map(nums=>({nums,score:comboScore(nums,m,c.max)})).sort((a,b)=>b.score-a.score);let chosen=[];for(const x of all){if(chosen.every(y=>x.nums.filter(n=>y.nums.includes(n)).length<=c.pick-2))chosen.push(x);if(chosen.length===3)break}if(chosen.length<3)chosen=all.slice(0,3);return{top,chosen,rank:s}}
+function balls(ns,cls=''){return `<div class="nums ${cls}">${ns.map(n=>`<span class="n">${String(n).padStart(2,'0')}</span>`).join('')}</div>`}
+function render(){const root=document.getElementById('cards');root.innerHTML='';for(const key of ['l6','l7']){const c=CFG[key],r=analyze(key);root.innerHTML+=`<section class="card"><div class="row"><h2>${c.name}</h2><span class="tag">TOP10 → ${c.pick}数字</span></div><div class="muted" style="margin-top:10px">候補10数字</div>${balls(r.top)}<div class="metric">本命</div>${balls(r.chosen[0].nums,'final')}<div class="alt"><div class="muted">第2候補</div>${balls(r.chosen[1].nums)}</div><div class="alt"><div class="muted">第3候補</div>${balls(r.chosen[2].nums)}</div>${evalHTML(key)}<details><summary>数字別スコアを見る</summary><div class="metric">${r.rank.slice(0,10).map(x=>`${String(x.n).padStart(2,'0')}：${x.score}`).join('　')}</div></details></section>`}const now=new Date();document.getElementById('updated').textContent=`端末計算 ${now.getHours()}:${String(now.getMinutes()).padStart(2,'0')}`;localStorage.setItem('loto-last-analysis',JSON.stringify({at:now.toISOString()}))}
+purgeLegacy();
+loadData().then(()=>{render();document.getElementById('run').onclick=async()=>{try{if(!navigator.onLine)throw new Error('オフラインです。保存済み履歴の分析は利用できます。');document.getElementById('status').textContent='最新履歴を再取得・監査中…';const [l6,l7]=await Promise.all([fetchRemote('l6'),fetchRemote('l7')]);DATA.l6=l6.draws.map(x=>x.main);DATA.l7=l7.draws.map(x=>x.main);META={l6:l6.meta,l7:l7.meta};BTCACHE={};saveBTCache();await loadData();render()}catch(e){document.getElementById('status').innerHTML=`<span class="bad">更新失敗: ${e.message}</span>`}}}).catch(e=>{document.getElementById('cards').innerHTML=`<section class="card"><h2>データ検査エラー</h2><p>${e.message}</p></section>`});
+window.addEventListener('online',()=>loadData().then(render).catch(()=>{}));window.addEventListener('offline',()=>{const el=document.getElementById('status');if(el)el.innerHTML+='<div class="audit stale">オフラインになりました。保存済み履歴で分析を継続できます。</div>'});
+if('serviceWorker' in navigator){navigator.serviceWorker.register('./sw.js',{updateViaCache:'none'}).then(r=>r.update()).catch(()=>{})}
+</script></body></html>
