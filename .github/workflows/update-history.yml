@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: loto-history-update
+  cancel-in-progress: false
+
 jobs:
   update:
     runs-on: ubuntu-latest
@@ -19,13 +23,26 @@ jobs:
       - name: Fetch and validate history
         run: python update_history.py
       - name: Commit updated CSV
+        shell: bash
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/LOTO6_ALL.csv data/LOTO7_ALL.csv
           if git diff --cached --quiet; then
             echo "No history changes"
-          else
-            git commit -m "Update LOTO history"
-            git push
+            exit 0
           fi
+          git commit -m "Update LOTO history"
+          for attempt in 1 2 3 4 5; do
+            git fetch origin main
+            git rebase origin/main
+            if git push origin HEAD:main; then
+              echo "History updated successfully"
+              exit 0
+            fi
+            echo "Push conflict; retrying ($attempt/5)"
+            sleep 3
+          done
+          echo "Could not push history after 5 attempts" >&2
+          exit 1
